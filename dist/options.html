@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Skip the Video — Settings</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main>
+    <header>
+      <img src="icons/icon48.png" width="40" height="40" alt="">
+      <div>
+        <h1>Skip the Video</h1>
+        <p class="sub">YouTube summaries by Claude. Get the point, skip the 25 minutes.</p>
+      </div>
+    </header>
+
+    <form id="form">
+      <section>
+        <label for="apiKey">Anthropic API key</label>
+        <div class="row">
+          <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…">
+          <button type="button" id="toggleKey" class="secondary">Show</button>
+        </div>
+        <p class="hint">
+          Get one at <a href="https://platform.claude.com/settings/keys" target="_blank" rel="noopener">platform.claude.com → API keys</a>.
+          It is stored only in this browser's extension storage and sent only to api.anthropic.com — never to YouTube.
+        </p>
+      </section>
+
+      <section>
+        <label for="model">Model</label>
+        <select id="model"></select>
+      </section>
+
+      <section>
+        <label for="effort">Thinking effort</label>
+        <select id="effort"></select>
+        <p class="hint">Low is plenty for summaries. Turn it up if you ask tricky follow-ups.</p>
+      </section>
+
+      <section>
+        <label for="language">Answer language</label>
+        <input id="language" type="text" list="languages" placeholder="English">
+        <datalist id="languages">
+          <option value="English"><option value="Slovak"><option value="Czech"><option value="German">
+          <option value="Spanish"><option value="French"><option value="Polish"><option value="Hungarian">
+        </datalist>
+        <p class="hint">Summaries come back in this language whatever language the video is in.</p>
+      </section>
+
+      <section class="check">
+        <input id="autoSummarize" type="checkbox">
+        <label for="autoSummarize">Automatically get “The point” when a video opens <span class="hint">(uses API credits on every video you open)</span></label>
+      </section>
+
+      <div class="actions">
+        <button type="submit">Save</button>
+        <span id="status" role="status"></span>
+      </div>
+    </form>
+
+    <section class="help">
+      <h2>How to use</h2>
+      <ul>
+        <li>Open any YouTube video. The panel sits at the top of the right-hand sidebar.</li>
+        <li><b>⚡ The point</b>: the payoff in 1–3 sentences and where it's revealed. <b>📋 Key points</b>: bullet takeaways. <b>📖 Deep dive</b>: section-by-section breakdown.</li>
+        <li>Click any timestamp to jump there. Ask follow-up questions in the box underneath.</li>
+        <li>Shortcut: <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> (change it at <code>brave://extensions/shortcuts</code>).</li>
+      </ul>
+    </section>
+  </main>
+  <script src="options.js"></script>
+</body>
+</html>
