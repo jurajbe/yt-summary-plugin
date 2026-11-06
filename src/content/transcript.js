@@ -227,7 +227,8 @@ export function pickTrack(tracks) {
 
 function trackLabel(track) {
   const name = track.name?.simpleText || track.name?.runs?.map((r) => r.text).join('') || track.languageCode;
-  return track.kind === 'asr' ? `${name} (auto-generated captions)` : `${name} captions`;
+  if (track.kind !== 'asr') return `${name} captions`;
+  return /auto-generated/i.test(name) ? `${name} captions` : `${name} (auto-generated captions)`;
 }
 
 function findPlayerPoToken(baseUrl) {

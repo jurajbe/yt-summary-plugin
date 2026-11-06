@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "Skip the Video — YouTube summaries by Claude",
+  "name": "Skip the Video — YouTube summaries (Ollama or Claude)",
   "short_name": "Skip the Video",
-  "version": "1.0.0",
-  "description": "Get the point of any YouTube video in seconds: TL;DR, key points or a deep dive, with clickable timestamps and follow-up questions.",
+  "version": "1.1.0",
+  "description": "Get the point of any YouTube video in seconds with a local Ollama model or Claude: TL;DR, key points or a deep dive, with clickable timestamps and follow-up questions.",
   "icons": {
     "16": "icons/icon16.png",
     "32": "icons/icon32.png",
@@ -22,8 +22,12 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://www.youtube.com/*"],
-      "js": ["content.js"],
+      "matches": [
+        "https://www.youtube.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ],
@@ -31,12 +35,27 @@
     "page": "options.html",
     "open_in_tab": true
   },
-  "permissions": ["storage"],
-  "host_permissions": ["https://api.anthropic.com/*"],
+  "permissions": [
+    "storage",
+    "alarms",
+    "declarativeNetRequestWithHostAccess"
+  ],
+  "host_permissions": [
+    "https://api.anthropic.com/*",
+    "https://ollama.com/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
   "commands": {
     "summarize": {
-      "suggested_key": { "default": "Alt+Shift+S" },
+      "suggested_key": {
+        "default": "Alt+Shift+S"
+      },
       "description": "Get the point of the current video"
     }
-  }
+  },
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ]
 }

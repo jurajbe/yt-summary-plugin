@@ -81,3 +81,32 @@ kbd, code {
   border-radius: 4px;
   padding: 0 4px;
 }
+
+[hidden] { display: none !important; }
+.label { display: block; font-weight: 600; margin-bottom: 8px; }
+.providers { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.provider {
+  display: flex; align-items: center; gap: 10px; margin: 0;
+  padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px;
+  font-weight: 500; cursor: pointer;
+}
+.provider:has(input:checked) { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.provider input { accent-color: var(--accent); margin: 0; }
+.provider-section { border-left: 3px solid var(--line); padding-left: 14px; margin-bottom: 18px; }
+.hint.ok { color: var(--ok); }
+.hint.error { color: var(--err); }
+.suggestions { margin: 0 0 4px; }
+.suggestions summary { cursor: pointer; font-weight: 600; margin-bottom: 8px; }
+.suggestions table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.suggestions th { text-align: left; font-size: 12px; color: var(--fg2); font-weight: 600; padding: 4px 6px; }
+.suggestions td { padding: 8px 6px; border-top: 1px solid var(--line); vertical-align: top; }
+.suggestions td .hint { margin-top: 2px; }
+.suggestions td:nth-child(2), .suggestions td:nth-child(3) { white-space: nowrap; color: var(--fg2); font-size: 13px; }
+button.small { padding: 4px 10px; font-size: 12.5px; white-space: nowrap; }
+@media (max-width: 560px) {
+  .providers { grid-template-columns: 1fr; }
+  .suggestions td:nth-child(3) { display: none; }
+  .suggestions th:nth-child(3) { display: none; }
+}
+.provider small { font-weight: normal; color: var(--fg2); }
+#cloudSection, #localSection { margin-top: -4px; }

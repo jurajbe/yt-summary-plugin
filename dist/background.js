@@ -1265,6 +1265,45 @@
     }
   });
 
+  // src/settings.js
+  var DEFAULT_SETTINGS = {
+    provider: "ollama",
+    // Claude
+    apiKey: "",
+    model: "claude-opus-5-5",
+    effort: "low",
+    // Ollama
+    ollamaMode: "cloud",
+    // 'cloud' (ollama.com, API key) or 'local' (your own Ollama server)
+    ollamaApiKey: "",
+    ollamaCloudModel: "",
+    // empty = best available cloud model
+    ollamaUrl: "http://localhost:11434",
+    ollamaModel: "",
+    ollamaMaxContext: 32768,
+    // Both
+    language: "English",
+    autoSummarize: false
+  };
+  async function loadSettings() {
+    const stored = await chrome.storage.local.get(Object.keys(DEFAULT_SETTINGS).concat("apiBaseUrl", "ollamaCloudBaseUrl"));
+    return { ...DEFAULT_SETTINGS, ...stored };
+  }
+  function isConfigured(s) {
+    if (s.provider !== "ollama") return Boolean(s.apiKey);
+    return s.ollamaMode === "local" ? Boolean(s.ollamaModel) : Boolean(s.ollamaApiKey);
+  }
+  async function loadPublicSettings() {
+    const s = await loadSettings();
+    return {
+      provider: s.provider,
+      ollamaMode: s.ollamaMode,
+      configured: isConfigured(s),
+      autoSummarize: s.autoSummarize,
+      modelName: s.provider !== "ollama" ? s.model : s.ollamaMode === "local" ? s.ollamaModel : s.ollamaCloudModel
+    };
+  }
+
   // node_modules/@anthropic-ai/sdk/internal/tslib.mjs
   function __classPrivateFieldSet(receiver, state, value, kind, f) {
     if (kind === "m")
@@ -26536,31 +26575,414 @@ ${video.transcript}
     return -1;
   }
 
-  // src/settings.js
-  var DEFAULT_SETTINGS = {
-    apiKey: "",
-    model: "claude-opus-5-5",
-    effort: "low",
-    language: "English",
-    autoSummarize: false
+  // src/providers/anthropic.js
+  var ProviderError = class extends Error {
+    constructor(message, code) {
+      super(message);
+      this.code = code;
+    }
   };
-  async function loadSettings() {
-    const stored = await chrome.storage.local.get(Object.keys(DEFAULT_SETTINGS).concat("apiBaseUrl"));
-    return { ...DEFAULT_SETTINGS, ...stored };
+  async function runAnthropic({ request, settings, signal, emit }) {
+    if (!settings.apiKey) {
+      throw new ProviderError("Add your Anthropic API key in the extension settings first.", "not-configured");
+    }
+    const client = new Anthropic({
+      apiKey: settings.apiKey,
+      dangerouslyAllowBrowser: true,
+      // the key lives only in this extension's storage, never in the page
+      ...settings.apiBaseUrl ? { baseURL: settings.apiBaseUrl } : {}
+    });
+    const supportsFallback = settings.model !== "claude-haiku-5-5";
+    const stream2 = client.beta.messages.stream(
+      {
+        model: settings.model,
+        max_tokens: 64e3,
+        system: systemPrompt(settings.language),
+        output_config: { effort: settings.effort },
+        messages: buildMessages(request),
+        ...supportsFallback ? { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" } : {}
+      },
+      { signal }
+    );
+    stream2.on("text", (text) => emit({ type: "delta", text }));
+    stream2.on("contentBlock", (block) => {
+      if (block.type === "fallback") emit({ type: "fallback", to: block.to?.model });
+    });
+    const message = await stream2.finalMessage();
+    if (message.stop_reason === "refusal") {
+      const category = message.stop_details?.category;
+      throw new ProviderError(
+        `Claude declined to answer this one${category ? ` (${category})` : ""}. Try rephrasing, or another video.`,
+        "refusal"
+      );
+    }
+    return {
+      text: finalText(message.content),
+      content: echoableContent(message.content),
+      truncated: message.stop_reason === "max_tokens",
+      model: message.model,
+      modelLabel: prettyClaude(message.model)
+    };
   }
-  async function loadPublicSettings() {
-    const { apiKey, apiBaseUrl, ...rest } = await loadSettings();
-    return { ...rest, hasApiKey: Boolean(apiKey) };
+  function prettyClaude(id) {
+    const m = /^claude-(\w+)-(\d+)-(\d+)/.exec(id || "");
+    return m ? `Claude ${m[1][0].toUpperCase()}${m[1].slice(1)} ${m[2]}.${m[3]}` : id;
+  }
+  function describeAnthropicError(err) {
+    if (err instanceof Anthropic.AuthenticationError) return "Your Anthropic API key was rejected. Check it in the extension settings.";
+    if (err instanceof Anthropic.PermissionDeniedError) return `Your API key doesn't have access to this model. Pick another model in settings. (${err.message})`;
+    if (err instanceof Anthropic.NotFoundError) return `Model not found \u2014 pick another model in settings. (${err.message})`;
+    if (err instanceof Anthropic.RateLimitError) return "Rate limited by the Anthropic API. Wait a moment and try again.";
+    if (err instanceof Anthropic.BadRequestError) return `The API rejected the request: ${err.message}`;
+    if (err instanceof Anthropic.APIConnectionError) return "Could not reach the Anthropic API. Check your connection (or Brave Shields / firewall).";
+    if (err instanceof Anthropic.APIError) {
+      if (err.status === 529) return "Claude is overloaded right now. Try again in a minute.";
+      return `Anthropic API error${err.status ? ` ${err.status}` : ""}: ${err.message}`;
+    }
+    return err?.message || String(err);
+  }
+
+  // src/providers/ollama.js
+  var DEFAULT_OLLAMA_URL = "http://localhost:11434";
+  var OLLAMA_CLOUD_URL = "https://ollama.com";
+  var PREFERRED_CLOUD_MODELS = [/^gpt-oss:120b/, /^deepseek-v3/, /^qwen3(?!-coder)/, /^kimi-k2/, /^glm-4/, /^gpt-oss/];
+  var ORIGIN_RULE_ID = 1;
+  var ANSWER_ROOM_TOKENS = 3072;
+  var MIN_CTX = 8192;
+  var OllamaError = class extends Error {
+    constructor(message, code) {
+      super(message);
+      this.code = code;
+    }
+  };
+  function normalizeBaseUrl(url) {
+    let u = (url || "").trim() || DEFAULT_OLLAMA_URL;
+    if (!/^https?:\/\//i.test(u)) u = `http://${u}`;
+    return new URL(u).origin;
+  }
+  var preparedOrigin = null;
+  async function prepareOllamaAccess(baseUrl) {
+    const origin = normalizeBaseUrl(baseUrl);
+    if (preparedOrigin === origin || !chrome.declarativeNetRequest) return;
+    await chrome.declarativeNetRequest.updateSessionRules({
+      removeRuleIds: [ORIGIN_RULE_ID],
+      addRules: [
+        {
+          id: ORIGIN_RULE_ID,
+          priority: 1,
+          action: { type: "modifyHeaders", requestHeaders: [{ header: "origin", operation: "remove" }] },
+          condition: {
+            urlFilter: `|${origin}/`,
+            // Only requests the extension's background worker makes; tabs (web
+            // pages) keep Ollama's normal origin protection.
+            tabIds: [chrome.tabs?.TAB_ID_NONE ?? -1],
+            initiatorDomains: [chrome.runtime.id],
+            resourceTypes: ["xmlhttprequest", "other"]
+          }
+        }
+      ]
+    });
+    preparedOrigin = origin;
+  }
+  function ollamaConnection(settings) {
+    if (settings.ollamaMode === "local") {
+      return { base: normalizeBaseUrl(settings.ollamaUrl), cloud: false, headers: {} };
+    }
+    const key = (settings.ollamaApiKey || "").trim();
+    return {
+      base: settings.ollamaCloudBaseUrl || OLLAMA_CLOUD_URL,
+      // override exists for tests only
+      cloud: true,
+      headers: key ? { Authorization: `Bearer ${key}` } : {}
+    };
+  }
+  function pickCloudModel(names) {
+    for (const re2 of PREFERRED_CLOUD_MODELS) {
+      const hit = names.find((n) => re2.test(n));
+      if (hit) return hit;
+    }
+    return names[0] || "gpt-oss:120b";
+  }
+  async function ollamaFetch(base, path3, { cloud = base === OLLAMA_CLOUD_URL, ...init } = {}) {
+    let res;
+    try {
+      res = await fetch(`${base}${path3}`, {
+        ...init,
+        headers: { "Content-Type": "application/json", ...init.headers || {} },
+        credentials: "omit"
+      });
+    } catch (err) {
+      if (init.signal?.aborted) throw err;
+      throw new OllamaError(
+        cloud ? `Can't reach ${base}. Check your internet connection (or Brave Shields / firewall).` : `Can't reach Ollama at ${base}. Make sure Ollama is running (open the Ollama app, or run "ollama serve").`,
+        "unreachable"
+      );
+    }
+    if (res.ok) return res;
+    let detail = "";
+    try {
+      const body = await res.text();
+      detail = JSON.parse(body).error || body;
+    } catch {
+    }
+    if (res.status === 401) {
+      throw new OllamaError("Ollama Cloud rejected the API key. Check it in the extension settings (ollama.com \u2192 Settings \u2192 Keys).", "auth");
+    }
+    if (res.status === 429) {
+      throw new OllamaError(`Ollama Cloud usage limit reached. ${detail ? `(${detail}) ` : ""}Wait a bit, or switch model or provider in settings.`, "rate-limit");
+    }
+    if (res.status === 403 && cloud) {
+      throw new OllamaError(`Ollama Cloud refused the request (403): ${detail || "your plan may not include this model"}.`, "forbidden");
+    }
+    if (res.status === 403) {
+      throw new OllamaError(
+        `Ollama at ${base} refused the extension (403). Set the environment variable OLLAMA_ORIGINS=chrome-extension://* and restart Ollama.`,
+        "forbidden"
+      );
+    }
+    if (res.status === 404 && /not found/i.test(detail)) {
+      const model = JSON.parse(init.body || "{}").model;
+      throw new OllamaError(
+        model ? cloud ? `Ollama Cloud doesn't offer "${model}" (any more). Pick another model in settings.` : `The model "${model}" isn't installed in Ollama. Run: ollama pull ${model}` : detail,
+        "model-missing"
+      );
+    }
+    throw new OllamaError(`Ollama error ${res.status}: ${detail || res.statusText}`, "http");
+  }
+  async function listModels({ base, cloud, headers }) {
+    if (!cloud) await prepareOllamaAccess(base);
+    const res = await ollamaFetch(base, "/api/tags", { headers, cloud });
+    const { models = [] } = await res.json();
+    return models.filter((m) => !/embed/i.test(m.name) && !(m.details?.family || "").includes("bert")).map((m) => ({
+      name: m.name,
+      size: m.size,
+      parameterSize: m.details?.parameter_size || "",
+      quantization: m.details?.quantization_level || ""
+    }));
+  }
+  var modelInfoCache = /* @__PURE__ */ new Map();
+  async function modelInfo(base, model, signal) {
+    const key = `${base}|${model}`;
+    if (modelInfoCache.has(key)) return modelInfoCache.get(key);
+    const res = await ollamaFetch(base, "/api/show", { method: "POST", body: JSON.stringify({ model }), signal });
+    const json = await res.json();
+    const ctxKey = Object.keys(json.model_info || {}).find((k) => k.endsWith(".context_length"));
+    const info = {
+      contextLength: ctxKey ? Number(json.model_info[ctxKey]) : null,
+      capabilities: json.capabilities || [],
+      family: json.details?.family || ""
+    };
+    modelInfoCache.set(key, info);
+    return info;
+  }
+  function toOllamaMessages(system, messages) {
+    const flatten = (content) => typeof content === "string" ? content : content.filter((b) => b.type === "text").map((b) => b.text).join("\n\n");
+    return [{ role: "system", content: system }, ...messages.map((m) => ({ role: m.role, content: flatten(m.content) }))];
+  }
+  function estimateTokens(text) {
+    return Math.ceil(text.length / 3);
+  }
+  function chooseNumCtx(promptTokens, { maxContext, modelContext }) {
+    const cap = Math.min(maxContext || 32768, modelContext || Infinity);
+    const needed = promptTokens + ANSWER_ROOM_TOKENS;
+    if (needed > cap) {
+      const limitedBy = modelContext && modelContext < maxContext ? "the model's context window" : 'your "Max context" setting';
+      throw new OllamaError(
+        `This video's transcript is too long for the current setup (needs ~${Math.round(needed / 1e3)}k tokens, limit is ${Math.round(cap / 1e3)}k from ${limitedBy}). ` + (limitedBy.startsWith("your") ? 'Raise "Max context" in settings (uses more memory).' : "Pick a model with a longer context window."),
+        "too-long"
+      );
+    }
+    const rounded = Math.ceil(Math.max(needed, MIN_CTX) / 4096) * 4096;
+    return Math.min(rounded, cap);
+  }
+  function thinkSetting(info, model, effort) {
+    if (!info?.capabilities?.includes("thinking")) return void 0;
+    if (/gpt-?oss/i.test(model) || /gptoss/i.test(info.family)) return effort;
+    return effort !== "low";
+  }
+  var ThinkFilter = class {
+    constructor() {
+      this.buffer = "";
+      this.inThink = false;
+      this.started = false;
+    }
+    push(chunk) {
+      this.buffer += chunk;
+      let out = "";
+      for (; ; ) {
+        if (this.inThink) {
+          const end = this.buffer.indexOf("</think>");
+          if (end === -1) {
+            this.buffer = this.buffer.slice(-7);
+            return this.emit(out);
+          }
+          this.buffer = this.buffer.slice(end + 8);
+          this.inThink = false;
+        } else {
+          const start = this.buffer.indexOf("<think>");
+          if (start === -1) {
+            const lt = this.buffer.lastIndexOf("<");
+            const hold = lt !== -1 && "<think>".startsWith(this.buffer.slice(lt)) ? this.buffer.length - lt : 0;
+            out += this.buffer.slice(0, this.buffer.length - hold);
+            this.buffer = this.buffer.slice(this.buffer.length - hold);
+            return this.emit(out);
+          }
+          out += this.buffer.slice(0, start);
+          this.buffer = this.buffer.slice(start + 7);
+          this.inThink = true;
+        }
+      }
+    }
+    flush() {
+      const rest = this.inThink ? "" : this.buffer;
+      this.buffer = "";
+      return this.emit(rest);
+    }
+    emit(text) {
+      if (!this.started) {
+        text = text.replace(/^\s+/, "");
+        if (text) this.started = true;
+      }
+      return text;
+    }
+    get thinking() {
+      return this.inThink;
+    }
+  };
+  async function runOllama({ request, settings, signal, emit, cloudModels = [] }) {
+    const { base, cloud, headers } = ollamaConnection(settings);
+    const messages = toOllamaMessages(systemPrompt(settings.language), buildMessages(request));
+    let model;
+    let options;
+    let think;
+    if (cloud) {
+      if (!headers.Authorization) {
+        throw new OllamaError("Add your Ollama API key in the extension settings first (ollama.com \u2192 Settings \u2192 Keys).", "not-configured");
+      }
+      model = settings.ollamaCloudModel || pickCloudModel(cloudModels.map((m) => m.name));
+      if (/gpt-?oss/i.test(model)) think = settings.effort;
+    } else {
+      model = settings.ollamaModel;
+      if (!model) throw new OllamaError("Pick an Ollama model in the extension settings first.", "not-configured");
+      await prepareOllamaAccess(base);
+      const info = await modelInfo(base, model, signal).catch((err) => {
+        if (err instanceof OllamaError && err.code !== "http") throw err;
+        return null;
+      });
+      options = {
+        num_ctx: chooseNumCtx(estimateTokens(messages.map((m) => m.content).join("\n")), {
+          maxContext: Number(settings.ollamaMaxContext) || 32768,
+          modelContext: info?.contextLength
+        })
+      };
+      think = thinkSetting(info, model, settings.effort);
+    }
+    emit({ type: "status", text: cloud ? `Asking ${model}\u2026` : `Loading ${model}\u2026` });
+    const res = await ollamaFetch(base, "/api/chat", {
+      method: "POST",
+      signal,
+      headers,
+      cloud,
+      body: JSON.stringify({
+        model,
+        messages,
+        stream: true,
+        ...think !== void 0 ? { think } : {},
+        ...options ? { options } : {}
+      })
+    });
+    const filter = new ThinkFilter();
+    const decoder = new TextDecoder();
+    const reader = res.body.getReader();
+    let pending = "";
+    let text = "";
+    let doneReason = "";
+    let announcedThinking = false;
+    const handleLine = (line) => {
+      if (!line.trim()) return;
+      const obj = JSON.parse(line);
+      if (obj.error) throw new OllamaError(`Ollama: ${obj.error}`, "stream");
+      const thinkingNow = Boolean(obj.message?.thinking) || filter.thinking;
+      if (thinkingNow && !announcedThinking) {
+        announcedThinking = true;
+        emit({ type: "status", text: `${model} is thinking\u2026` });
+      }
+      const visible = filter.push(obj.message?.content || "");
+      if (visible) {
+        text += visible;
+        emit({ type: "delta", text: visible });
+      }
+      if (obj.done) doneReason = obj.done_reason || "stop";
+    };
+    for (; ; ) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      pending += decoder.decode(value, { stream: true });
+      const lines = pending.split("\n");
+      pending = lines.pop();
+      lines.forEach(handleLine);
+    }
+    handleLine(pending);
+    const rest = filter.flush();
+    if (rest) {
+      text += rest;
+      emit({ type: "delta", text: rest });
+    }
+    return {
+      text,
+      content: [{ type: "text", text: text || "(no answer)" }],
+      truncated: doneReason === "length",
+      model,
+      modelLabel: `${model} \xB7 Ollama${cloud ? " Cloud" : ""}`
+    };
+  }
+  function describeOllamaError(err) {
+    return err?.message || String(err);
+  }
+
+  // src/cloudModels.js
+  var REFRESH_ALARM = "refresh-cloud-models";
+  var DAY_MS = 24 * 60 * 60 * 1e3;
+  async function getCachedCloudModels() {
+    const { cloudModels = [], cloudModelsFetchedAt = 0 } = await chrome.storage.local.get(["cloudModels", "cloudModelsFetchedAt"]);
+    return { models: cloudModels, fetchedAt: cloudModelsFetchedAt };
+  }
+  async function refreshCloudModels({ force = false, apiKey } = {}) {
+    const cached = await getCachedCloudModels();
+    if (!force && cached.models.length && Date.now() - cached.fetchedAt < DAY_MS) return cached;
+    const settings = await loadSettings();
+    const models = await listModels(ollamaConnection({ ...settings, ...apiKey ? { ollamaApiKey: apiKey } : {}, ollamaMode: "cloud" }));
+    const fetchedAt = Date.now();
+    await chrome.storage.local.set({ cloudModels: models, cloudModelsFetchedAt: fetchedAt });
+    return { models, fetchedAt };
+  }
+  async function ensureRefreshAlarm() {
+    if (!chrome.alarms) return;
+    const existing = await chrome.alarms.get(REFRESH_ALARM);
+    if (!existing) chrome.alarms.create(REFRESH_ALARM, { delayInMinutes: 1, periodInMinutes: 24 * 60 });
   }
 
   // src/background.js
   chrome.storage.local.setAccessLevel?.({ accessLevel: "TRUSTED_CONTEXTS" }).catch(() => {
   });
   chrome.runtime.onInstalled.addListener(async ({ reason }) => {
-    if (reason === "install") {
-      const { apiKey } = await loadSettings();
-      if (!apiKey) chrome.runtime.openOptionsPage();
-    }
+    if (reason === "install") chrome.runtime.openOptionsPage();
+    ensureRefreshAlarm();
+    refreshCloudModels().catch(() => {
+    });
+  });
+  chrome.runtime.onStartup.addListener(() => {
+    ensureRefreshAlarm();
+    refreshCloudModels().catch(() => {
+    });
+  });
+  chrome.alarms?.onAlarm.addListener((alarm) => {
+    if (alarm.name === REFRESH_ALARM) refreshCloudModels({ force: true }).catch(() => {
+    });
+  });
+  chrome.storage.onChanged.addListener((changes) => {
+    if (changes.ollamaUrl) prepareOllamaAccess(changes.ollamaUrl.newValue).catch(() => {
+    });
   });
   chrome.action.onClicked.addListener(() => chrome.runtime.openOptionsPage());
   chrome.commands.onCommand.addListener(async (command) => {
@@ -26569,13 +26991,23 @@ ${video.transcript}
     if (tab?.id) chrome.tabs.sendMessage(tab.id, { type: "shortcut-summarize" }).catch(() => {
     });
   });
-  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg?.type === "getSettings") {
       loadPublicSettings().then(sendResponse);
       return true;
     }
     if (msg?.type === "openOptions") {
       chrome.runtime.openOptionsPage();
+      return false;
+    }
+    const fromExtensionPage = sender.url?.startsWith(chrome.runtime.getURL(""));
+    if (msg?.type === "cloudModels" && fromExtensionPage) {
+      refreshCloudModels({ force: Boolean(msg.force), apiKey: typeof msg.apiKey === "string" ? msg.apiKey : void 0 }).then((r) => sendResponse({ ok: true, ...r })).catch(async (err) => sendResponse({ ok: false, error: describeOllamaError(err), ...await getCachedCloudModels() }));
+      return true;
+    }
+    if (msg?.type === "ollamaModels" && fromExtensionPage) {
+      listModels({ base: normalizeBaseUrl(msg.url), cloud: false, headers: {} }).then((models) => sendResponse({ ok: true, models, url: normalizeBaseUrl(msg.url) })).catch((err) => sendResponse({ ok: false, error: describeOllamaError(err) }));
+      return true;
     }
     return false;
   });
@@ -26589,75 +27021,25 @@ ${video.transcript}
       }
       if (msg?.type !== "run") return;
       controller = new AbortController();
+      const signal = controller.signal;
+      const settings = await loadSettings();
+      const ollama = settings.provider === "ollama";
       try {
-        await runRequest(msg.request, port, controller.signal);
+        const run = ollama ? runOllama : runAnthropic;
+        const cloudModels = ollama ? (await getCachedCloudModels()).models : [];
+        const result = await run({ request: msg.request, settings, signal, cloudModels, emit: (m) => safePost(port, m) });
+        safePost(port, { type: "done", ...result });
       } catch (err) {
-        if (controller.signal.aborted) return;
-        safePost(port, { type: "error", message: describeError(err) });
+        if (signal.aborted) return;
+        safePost(port, {
+          type: "error",
+          code: err?.code,
+          message: ollama ? describeOllamaError(err) : describeAnthropicError(err)
+        });
       }
     });
     port.onDisconnect.addListener(() => controller?.abort());
   });
-  async function runRequest(request, port, signal) {
-    const settings = await loadSettings();
-    if (!settings.apiKey) {
-      safePost(port, { type: "error", code: "no-key", message: "Add your Anthropic API key in the extension settings first." });
-      return;
-    }
-    const client = new Anthropic({
-      apiKey: settings.apiKey,
-      dangerouslyAllowBrowser: true,
-      // the key lives only in this extension's storage, never in the page
-      ...settings.apiBaseUrl ? { baseURL: settings.apiBaseUrl } : {}
-    });
-    const messages = buildMessages(request);
-    const supportsFallback = settings.model !== "claude-haiku-5-5";
-    const stream2 = client.beta.messages.stream(
-      {
-        model: settings.model,
-        max_tokens: 64e3,
-        system: systemPrompt(settings.language),
-        output_config: { effort: settings.effort },
-        messages,
-        ...supportsFallback ? { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" } : {}
-      },
-      { signal }
-    );
-    stream2.on("text", (text) => safePost(port, { type: "delta", text }));
-    stream2.on("contentBlock", (block) => {
-      if (block.type === "fallback") safePost(port, { type: "fallback", to: block.to?.model });
-    });
-    const message = await stream2.finalMessage();
-    if (message.stop_reason === "refusal") {
-      const category = message.stop_details?.category;
-      safePost(port, {
-        type: "error",
-        code: "refusal",
-        message: `Claude declined to answer this one${category ? ` (${category})` : ""}. Try rephrasing, or another video.`
-      });
-      return;
-    }
-    safePost(port, {
-      type: "done",
-      text: finalText(message.content),
-      content: echoableContent(message.content),
-      truncated: message.stop_reason === "max_tokens",
-      model: message.model
-    });
-  }
-  function describeError(err) {
-    if (err instanceof Anthropic.AuthenticationError) return "Your Anthropic API key was rejected. Check it in the extension settings.";
-    if (err instanceof Anthropic.PermissionDeniedError) return `Your API key doesn't have access to this model. Pick another model in settings. (${err.message})`;
-    if (err instanceof Anthropic.NotFoundError) return `Model not found \u2014 pick another model in settings. (${err.message})`;
-    if (err instanceof Anthropic.RateLimitError) return "Rate limited by the Anthropic API. Wait a moment and try again.";
-    if (err instanceof Anthropic.BadRequestError) return `The API rejected the request: ${err.message}`;
-    if (err instanceof Anthropic.APIConnectionError) return "Could not reach the Anthropic API. Check your connection (or Brave Shields / firewall).";
-    if (err instanceof Anthropic.APIError) {
-      if (err.status === 529) return "Claude is overloaded right now. Try again in a minute.";
-      return `Anthropic API error${err.status ? ` ${err.status}` : ""}: ${err.message}`;
-    }
-    return err?.message || String(err);
-  }
   function safePost(port, msg) {
     try {
       port.postMessage(msg);

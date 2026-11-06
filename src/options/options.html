@@ -12,32 +12,107 @@
       <img src="icons/icon48.png" width="40" height="40" alt="">
       <div>
         <h1>Skip the Video</h1>
-        <p class="sub">YouTube summaries by Claude. Get the point, skip the 25 minutes.</p>
+        <p class="sub">Get the point of any YouTube video. Skip the 25 minutes.</p>
       </div>
     </header>
 
     <form id="form">
       <section>
-        <label for="apiKey">Anthropic API key</label>
-        <div class="row">
-          <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…">
-          <button type="button" id="toggleKey" class="secondary">Show</button>
+        <span class="label">Which AI should summarize?</span>
+        <div class="providers" id="providers"></div>
+      </section>
+
+      <!-- ───────────── Ollama ───────────── -->
+      <div id="ollamaSection" class="provider-section">
+        <section>
+          <span class="label">Where do the Ollama models run?</span>
+          <div class="providers" id="ollamaModes">
+            <label class="provider"><input type="radio" name="ollamaMode" value="cloud"><span>Ollama Cloud <small>— big models, nothing to install</small></span></label>
+            <label class="provider"><input type="radio" name="ollamaMode" value="local"><span>My computer <small>— local Ollama app</small></span></label>
+          </div>
+        </section>
+
+        <div id="cloudSection">
+          <section>
+            <label for="ollamaApiKey">Ollama API key</label>
+            <div class="row">
+              <input id="ollamaApiKey" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your ollama.com API key">
+              <button type="button" id="toggleOllamaKey" class="secondary">Show</button>
+            </div>
+            <p class="hint">
+              Create one at <a href="https://ollama.com/settings/keys" target="_blank" rel="noopener">ollama.com → Settings → Keys</a> (free account; usage limits depend on your plan).
+              Stored only in this browser's extension storage and sent only to ollama.com.
+            </p>
+          </section>
+
+          <section>
+            <label for="ollamaCloudModel">Cloud model</label>
+            <div class="row">
+              <select id="ollamaCloudModel"></select>
+              <button type="button" id="refreshCloud" class="secondary">Refresh</button>
+            </div>
+            <p class="hint" id="cloudStatus">The list of cloud models refreshes automatically once a day.</p>
+          </section>
         </div>
-        <p class="hint">
-          Get one at <a href="https://platform.claude.com/settings/keys" target="_blank" rel="noopener">platform.claude.com → API keys</a>.
-          It is stored only in this browser's extension storage and sent only to api.anthropic.com — never to YouTube.
-        </p>
-      </section>
 
-      <section>
-        <label for="model">Model</label>
-        <select id="model"></select>
-      </section>
+        <div id="localSection">
+          <section>
+            <label for="ollamaUrl">Ollama server</label>
+            <div class="row">
+              <input id="ollamaUrl" type="text" spellcheck="false" placeholder="http://localhost:11434">
+              <button type="button" id="connect" class="secondary">Connect</button>
+            </div>
+            <p class="hint" id="ollamaStatus">Ollama must be running on this computer (or on your network).</p>
+          </section>
 
+          <section>
+            <label for="ollamaModel">Model</label>
+            <select id="ollamaModel"><option value="">— click Connect to list your models —</option></select>
+            <p class="hint">Any chat model you've pulled works. Not sure? See the suggestions below.</p>
+          </section>
+
+          <section>
+            <label for="ollamaMaxContext">Max context</label>
+            <select id="ollamaMaxContext"></select>
+            <p class="hint">How much transcript the model may read at once. The extension only uses what each video needs, up to this limit. Higher limits allow longer videos but need more memory.</p>
+          </section>
+
+          <details class="suggestions" id="suggestions">
+            <summary>Suggested local models (copy a command into your terminal)</summary>
+            <table>
+              <thead><tr><th>Model</th><th>Download</th><th>Needs</th><th></th></tr></thead>
+              <tbody id="suggestedModels"></tbody>
+            </table>
+            <p class="hint">Rule of thumb: 12B+ models catch the actual "trick" far more reliably than 3–4B ones, which tend to miss or invent details on long videos.</p>
+          </details>
+        </div>
+      </div>
+
+      <!-- ───────────── Claude ───────────── -->
+      <div id="anthropicSection" class="provider-section">
+        <section>
+          <label for="apiKey">Anthropic API key</label>
+          <div class="row">
+            <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…">
+            <button type="button" id="toggleKey" class="secondary">Show</button>
+          </div>
+          <p class="hint">
+            Get one at <a href="https://platform.claude.com/settings/keys" target="_blank" rel="noopener">platform.claude.com → API keys</a>.
+            Stored only in this browser's extension storage and sent only to api.anthropic.com — never to YouTube.
+          </p>
+        </section>
+
+        <section>
+          <label for="model">Model</label>
+          <select id="model"></select>
+        </section>
+      </div>
+
+      <!-- ───────────── Both ───────────── -->
       <section>
         <label for="effort">Thinking effort</label>
         <select id="effort"></select>
-        <p class="hint">Low is plenty for summaries. Turn it up if you ask tricky follow-ups.</p>
+        <p class="hint">Low is plenty for summaries and fastest. For reasoning models (gpt-oss, qwen3, deepseek) Low turns thinking off or down.</p>
       </section>
 
       <section>
@@ -52,7 +127,7 @@
 
       <section class="check">
         <input id="autoSummarize" type="checkbox">
-        <label for="autoSummarize">Automatically get “The point” when a video opens <span class="hint">(uses API credits on every video you open)</span></label>
+        <label for="autoSummarize">Automatically get “The point” when a video opens <span class="hint" id="autoHint"></span></label>
       </section>
 
       <div class="actions">

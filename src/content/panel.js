@@ -49,7 +49,7 @@ export class Panel {
 
     this.settings = await getSettings();
     this.render();
-    if (this.settings?.autoSummarize && this.settings.hasApiKey && !state.outputs.tldr.text && this.state === state) {
+    if (this.settings?.autoSummarize && this.settings.configured && !state.outputs.tldr.text && this.state === state) {
       this.runMode('tldr');
     }
   }
@@ -192,8 +192,8 @@ export class Panel {
     // ---- summary output
     this.output.replaceChildren();
     const out = s.activeMode ? s.outputs[s.activeMode] : null;
-    if (this.settings && !this.settings.hasApiKey) {
-      this.output.append(noKeyNotice());
+    if (this.settings && !this.settings.configured) {
+      this.output.append(setupNotice(this.settings));
     } else if (!out) {
       const p = document.createElement('p');
       p.className = 'placeholder';
@@ -225,7 +225,7 @@ export class Panel {
     }
     this.clearChatBtn.hidden = s.chat.display.length === 0 || s.chat.busy;
     this.askBtn.disabled = s.chat.busy;
-    this.chatInput.disabled = Boolean(this.settings && !this.settings.hasApiKey);
+    this.chatInput.disabled = Boolean(this.settings && !this.settings.configured);
   }
 
   // ------------------------------------------------------------ actions
@@ -259,15 +259,19 @@ export class Panel {
 
     try {
       const video = await this.ensureVideo(s);
-      out.status = 'Asking Claude…';
+      out.status = 'Generating…';
       this.queueRender();
       const result = await this.stream(s, { kind: 'summary', mode, video }, {
         onDelta: (full) => {
           out.text = full;
           this.queueRender();
         },
+        onStatus: (text) => {
+          out.status = text;
+          this.queueRender();
+        },
       });
-      Object.assign(out, { text: result.text, truncated: result.truncated, model: result.model });
+      Object.assign(out, { text: result.text, truncated: result.truncated, model: result.modelLabel || result.model });
     } catch (err) {
       out.text = '';
       // A cancelled run (user left the video) just resets so it can be re-run.
@@ -307,6 +311,10 @@ export class Panel {
           reply.text = full;
           this.queueRender();
         },
+        onStatus: (text) => {
+          reply.status = text;
+          this.queueRender();
+        },
       });
       reply.text = result.text + (result.truncated ? '\n\n_(cut off at the length limit)_' : '');
       s.chat.turns.push({ role: 'assistant', content: result.content });
@@ -343,8 +351,9 @@ export class Panel {
   // ------------------------------------------------------------ plumbing
 
   async ensureKey() {
-    if (!this.settings?.hasApiKey) this.settings = await getSettings();
-    if (this.settings?.hasApiKey) return true;
+    // Settings may have changed in the options page since this video opened.
+    this.settings = (await getSettings()) || this.settings;
+    if (this.settings?.configured) return true;
     this.render();
     return false;
   }
@@ -363,7 +372,7 @@ export class Panel {
   }
 
   /** Runs one request through the background worker, streaming text back. */
-  stream(s, request, { onDelta }) {
+  stream(s, request, { onDelta, onStatus }) {
     return new Promise((resolve, reject) => {
       const port = chrome.runtime.connect({ name: 'claude' });
       let full = '';
@@ -384,6 +393,8 @@ export class Panel {
         if (msg.type === 'delta') {
           full += msg.text;
           onDelta(full);
+        } else if (msg.type === 'status') {
+          if (!full) onStatus?.(msg.text);
         } else if (msg.type === 'fallback') {
           // Another model took over after a decline; restart the visible text.
           full = '';
@@ -391,7 +402,7 @@ export class Panel {
         } else if (msg.type === 'done') {
           finish(resolve, msg);
         } else if (msg.type === 'error') {
-          if (msg.code === 'no-key' && this.settings) this.settings.hasApiKey = false;
+          if (msg.code === 'not-configured' && this.settings) this.settings.configured = false;
           finish(reject, new Error(msg.message));
         }
       });
@@ -443,14 +454,9 @@ function firstQuestionText(s, question) {
 
 function metaText(s, out) {
   const parts = [];
-  if (out.model) parts.push(prettyModel(out.model));
+  if (out.model) parts.push(out.model);
   if (s.videoInfo?.captionLabel) parts.push(`from ${s.videoInfo.captionLabel}`);
   return parts.join(' · ');
-}
-
-function prettyModel(id) {
-  const m = id.match(/^claude-(\w+)-(\d+)-(\d+)/);
-  return m ? `Claude ${m[1][0].toUpperCase()}${m[1].slice(1)} ${m[2]}.${m[3]}` : id;
 }
 
 function statusLine(text) {
@@ -469,11 +475,16 @@ function errorLine(text) {
   return p;
 }
 
-function noKeyNotice() {
+function setupNotice(settings) {
   const wrap = document.createElement('div');
   wrap.className = 'notice';
   const p = document.createElement('p');
-  p.textContent = 'Add your Anthropic API key once and every video gets a "skip to the point" button.';
+  p.textContent =
+    settings.provider !== 'ollama'
+      ? 'Add your Anthropic API key once and every video gets a "skip to the point" button.'
+      : settings.ollamaMode === 'local'
+        ? 'Pick which Ollama model to use (one-time setup) and every video gets a "skip to the point" button.'
+        : 'Add your Ollama API key once (free at ollama.com) and every video gets a "skip to the point" button.';
   const b = document.createElement('button');
   b.className = 'ask-btn';
   b.textContent = 'Open settings';

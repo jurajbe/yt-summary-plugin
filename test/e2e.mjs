@@ -67,6 +67,70 @@ const server = http.createServer((req, res) => {
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const apiBase = `http://127.0.0.1:${server.address().port}`;
 
+// ------------------------------------------------------------------ fake Ollama (cloud + local)
+
+function makeOllamaMock({ cloud }) {
+  const state = { requests: [], tagsHits: 0, answers: [] };
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      const entry = { url: req.url, headers: req.headers, body: body ? JSON.parse(body) : null };
+      state.requests.push(entry);
+      const json = (status, obj) => {
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(obj));
+      };
+      // Real Ollama rejects browser-extension origins unless OLLAMA_ORIGINS allows them.
+      const origin = req.headers.origin;
+      if (!cloud && origin && !/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return json(403, {});
+      if (cloud && req.headers.authorization !== 'Bearer good-key') return json(401, { error: 'unauthorized' });
+
+      if (req.url === '/api/tags') {
+        state.tagsHits++;
+        const models = cloud
+          ? [
+              { name: 'qwen3-coder:480b', size: 0, details: { parameter_size: '480B' } },
+              { name: 'gpt-oss:120b', size: 0, details: { parameter_size: '116.8B' } },
+              { name: 'deepseek-v3.1:671b', size: 0, details: { parameter_size: '671B' } },
+            ]
+          : [
+              { name: 'qwen3:8b', size: 5.2e9, details: { parameter_size: '8.2B', family: 'qwen3' } },
+              { name: 'nomic-embed-text:latest', size: 2.7e8, details: { family: 'nomic-bert' } },
+            ];
+        return json(200, { models });
+      }
+      if (req.url === '/api/show') {
+        return json(200, { model_info: { 'qwen3.context_length': 40960 }, capabilities: ['completion', 'thinking'], details: { family: 'qwen3' } });
+      }
+      if (req.url === '/api/chat') {
+        res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+        const answer = state.answers.shift() ?? 'Ollama answer.';
+        const lines = [
+          { message: { role: 'assistant', content: '', thinking: 'hmm' }, done: false },
+          { message: { role: 'assistant', content: '<think>inline reasoning</th' }, done: false },
+          { message: { role: 'assistant', content: 'ink>\n\n' }, done: false },
+          ...answer.match(/[\s\S]{1,10}/g).map((c) => ({ message: { role: 'assistant', content: c }, done: false })),
+          { message: { role: 'assistant', content: '' }, done: true, done_reason: 'stop' },
+        ];
+        let i = 0;
+        const tick = () => {
+          if (i < lines.length) {
+            res.write(`${JSON.stringify(lines[i++])}\n`);
+            return setTimeout(tick, 5);
+          }
+          res.end();
+        };
+        return tick();
+      }
+      json(404, { error: 'not found' });
+    });
+  });
+  return new Promise((r) => srv.listen(0, '127.0.0.1', () => r({ srv, state, base: `http://127.0.0.1:${srv.address().port}` })));
+}
+const ollamaCloud = await makeOllamaMock({ cloud: true });
+const ollamaLocal = await makeOllamaMock({ cloud: false });
+
 // ------------------------------------------------------------------ fake YouTube
 
 const playerResponse = {
@@ -184,7 +248,7 @@ try {
 
   const sw = context.serviceWorkers()[0] || (await context.waitForEvent('serviceworker'));
   await sw.evaluate(
-    (base) => chrome.storage.local.set({ apiKey: 'sk-ant-test-key', apiBaseUrl: base, model: 'claude-opus-5-5', effort: 'low', language: 'English' }),
+    (base) => chrome.storage.local.set({ provider: 'anthropic', apiKey: 'sk-ant-test-key', apiBaseUrl: base, model: 'claude-opus-5-5', effort: 'low', language: 'English' }),
     apiBase,
   );
 
@@ -283,7 +347,7 @@ try {
   await panel2.locator('.output', { hasText: 'Fallback worked.' }).waitFor({ timeout: 15000 });
   assert.ok(yt.timedtextHits >= 1);
   assert.match(apiRequests.at(-1).body.messages[0].content[0].text, /\[0:30\] more/);
-  assert.match(apiRequests.at(-1).body.messages[0].content[0].text, /auto-generated captions/);
+  assert.match(apiRequests.at(-1).body.messages[0].content[0].text, /English \(auto-generated\) captions/);
   console.log('✓ falls back to the caption track when the transcript API fails');
 
   // --- API error surfaces in the panel
@@ -311,6 +375,116 @@ try {
   await opts.screenshot({ path: 'test-results/options.png', fullPage: true });
   console.log('✓ options page saves settings');
 
+  // ================================================================ Ollama Cloud
+  yt.transcriptApiStatus = 200;
+  await sw.evaluate(
+    (base) => chrome.storage.local.set({ provider: 'ollama', ollamaMode: 'cloud', ollamaApiKey: 'good-key', ollamaCloudModel: '', ollamaCloudBaseUrl: base, cloudModels: [], cloudModelsFetchedAt: 0 }),
+    ollamaCloud.base,
+  );
+  const alarm = await sw.evaluate(() => chrome.alarms.get('refresh-cloud-models'));
+  assert.equal(alarm?.periodInMinutes, 24 * 60, 'daily refresh alarm registered');
+  console.log('✓ daily cloud-model refresh alarm is registered');
+
+  await opts.reload();
+  await opts.locator('#cloudStatus.ok').waitFor({ timeout: 10000 });
+  assert.match(await opts.locator('#cloudStatus').textContent(), /3 cloud models · updated just now · refreshes daily/);
+  assert.match(await opts.locator('#ollamaCloudModel option').first().textContent(), /Auto — best available \(now: gpt-oss:120b\)/);
+  assert.equal(ollamaCloud.state.tagsHits, 1);
+  await opts.screenshot({ path: 'test-results/options-ollama-cloud.png', fullPage: true });
+
+  // Cached list is reused while fresh, refetched once it's over a day old.
+  await opts.reload();
+  await opts.locator('#cloudStatus.ok').waitFor();
+  assert.equal(ollamaCloud.state.tagsHits, 1, 'fresh cache reused');
+  await sw.evaluate(() => chrome.storage.local.set({ cloudModelsFetchedAt: Date.now() - 25 * 3600 * 1000 }));
+  await opts.reload();
+  await opts.locator('#cloudStatus.ok').waitFor();
+  assert.equal(ollamaCloud.state.tagsHits, 2, 'stale cache refreshed');
+  console.log('✓ cloud model list cached, refreshed when over a day old');
+
+  ollamaCloud.state.answers.push('**The point:** Cloud says: plan tonight.\n\n**Where:** [1:05]');
+  const page4 = await context.newPage();
+  await page4.goto(`https://www.youtube.com/watch?v=${VIDEO_ID}`);
+  const panel4 = page4.locator('#yt-summary-claude');
+  await panel4.locator('.tab', { hasText: 'The point' }).click();
+  await panel4.locator('.output', { hasText: 'Cloud says: plan tonight.' }).waitFor({ timeout: 10000 });
+  await panel4.locator('.meta', { hasText: 'gpt-oss:120b · Ollama Cloud' }).waitFor();
+  const outText = await panel4.locator('.output').innerText();
+  assert.ok(!/think|reasoning/i.test(outText), 'thinking stripped from answer');
+  let chat = ollamaCloud.state.requests.at(-1);
+  assert.equal(chat.url, '/api/chat');
+  assert.equal(chat.headers.authorization, 'Bearer good-key');
+  assert.equal(chat.body.model, 'gpt-oss:120b');
+  assert.equal(chat.body.think, 'low');
+  assert.equal(chat.body.stream, true);
+  assert.equal(chat.body.options, undefined);
+  assert.equal(chat.body.messages[0].role, 'system');
+  assert.match(chat.body.messages[1].content, /\[1:05\] the one that worked/);
+  await panel4.screenshot({ path: 'test-results/panel-ollama-cloud.png' });
+  console.log('✓ Ollama Cloud: auto-picked gpt-oss:120b, bearer key, thinking hidden');
+
+  // Follow-up on Ollama keeps plain-text history
+  ollamaCloud.state.answers.push('He uses a paper note.');
+  await panel4.locator('textarea').fill('how?');
+  await panel4.locator('textarea').press('Enter');
+  await panel4.locator('.msg.assistant', { hasText: 'paper note' }).waitFor({ timeout: 10000 });
+  ollamaCloud.state.answers.push('Two weeks.');
+  await panel4.locator('textarea').fill('how long?');
+  await panel4.locator('textarea').press('Enter');
+  await panel4.locator('.msg.assistant', { hasText: 'Two weeks.' }).waitFor({ timeout: 10000 });
+  chat = ollamaCloud.state.requests.at(-1);
+  assert.deepEqual(chat.body.messages.slice(2), [
+    { role: 'assistant', content: 'He uses a paper note.' },
+    { role: 'user', content: 'how long?' },
+  ]);
+  console.log('✓ Ollama follow-up chat keeps history');
+
+  // Wrong key → clear error
+  await sw.evaluate(() => chrome.storage.local.set({ ollamaApiKey: 'bad-key' }));
+  await panel4.locator('.tab', { hasText: 'Deep dive' }).click();
+  await panel4.locator('.output .error', { hasText: 'rejected the API key' }).waitFor({ timeout: 10000 });
+  console.log('✓ bad Ollama key shows a clear error');
+
+  // ================================================================ local Ollama
+  await sw.evaluate(
+    (base) => chrome.storage.local.set({ ollamaMode: 'local', ollamaUrl: base, ollamaModel: 'qwen3:8b' }),
+    ollamaLocal.base,
+  );
+  await opts.reload();
+  await opts.locator('#ollamaStatus.ok').waitFor({ timeout: 10000 }).catch(async (e) => {
+    console.log('ollamaStatus:', await opts.locator('#ollamaStatus').textContent(), JSON.stringify(ollamaLocal.state.requests.map((r) => [r.url, r.headers.origin])));
+    throw e;
+  });
+  assert.deepEqual(await opts.locator('#ollamaModel option').allTextContents(), ['qwen3:8b (8.2B) · 5.2 GB'], 'embedding models filtered out');
+  console.log('✓ settings page lists local models (Origin header stripped, no 403)');
+
+  ollamaLocal.state.answers.push('- [0:00] Local model works.');
+  const page5 = await context.newPage();
+  await page5.goto(`https://www.youtube.com/watch?v=${VIDEO_ID}`);
+  const panel5 = page5.locator('#yt-summary-claude');
+  await panel5.locator('.tab', { hasText: 'Key points' }).click();
+  await panel5.locator('.output', { hasText: 'Local model works.' }).waitFor({ timeout: 10000 });
+  chat = ollamaLocal.state.requests.at(-1);
+  assert.equal(chat.url, '/api/chat');
+  assert.equal(chat.headers.origin, undefined, 'Origin header removed by the DNR rule');
+  assert.equal(chat.body.model, 'qwen3:8b');
+  assert.equal(chat.body.think, false, 'effort low turns thinking off');
+  assert.ok(chat.body.options.num_ctx >= 8192 && chat.body.options.num_ctx <= 32768);
+  await panel5.locator('.meta', { hasText: 'qwen3:8b · Ollama' }).waitFor();
+  console.log(`✓ local Ollama: num_ctx ${chat.body.options.num_ctx}, think off, no 403`);
+
+  // Web pages still can't reach local Ollama through us (rule only covers the extension).
+  const pageOrigin = await page5.evaluate(async (base) => {
+    try {
+      const r = await fetch(`${base}/api/tags`);
+      return r.status;
+    } catch {
+      return 'blocked';
+    }
+  }, ollamaLocal.base);
+  assert.notEqual(pageOrigin, 200, 'youtube.com page must not get through to Ollama');
+  console.log(`✓ web pages still blocked from local Ollama (${pageOrigin})`);
+
   console.log('\nAll e2e checks passed.');
 } catch (err) {
   failed = true;
@@ -319,5 +493,7 @@ try {
 } finally {
   await context.close();
   server.close();
+  ollamaCloud.srv.close();
+  ollamaLocal.srv.close();
   process.exitCode = failed ? 1 : 0;
 }
